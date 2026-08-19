@@ -1,0 +1,1 @@
+java -jar target/proxy-checker-1.0.0.jar -f proxies.txt --geo-db GeoLite2-Country-Blocks-IPv4.csv.gz --asn-db asn-ipv4.csv.gz -o result.json --format json
