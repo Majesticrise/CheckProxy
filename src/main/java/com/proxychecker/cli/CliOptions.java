@@ -16,6 +16,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
+import com.proxychecker.domain.IpLocationInfo;
 
 @Command(
         name = "proxychecker",
@@ -87,13 +88,68 @@ public class CliOptions implements Callable<Integer> {
 
         System.out.println("Total proxies: " + allResults.size() + ", Working: " + workingResults.size());
 
+        // ===== 输出 JSON/CSV =====
         OutputFormatter formatter = switch (format) {
             case json -> new JsonOutputWriter();
             case csv -> new CsvOutputWriter();
         };
         formatter.write(workingResults, output);
-
         System.out.println("Results written to " + output.toAbsolutePath());
+
+        // ===== 新增：控制台表格输出可用代理 =====
+        if (!workingResults.isEmpty()) {
+            System.out.println("\n" + "=".repeat(80));
+            System.out.println("Working Proxies (" + workingResults.size() + "):");
+            System.out.println("=".repeat(80));
+
+            System.out.printf("%-4s | %-22s | %-10s | %-8s | %-15s | %-12s%n",
+                    "No.", "Proxy", "Delay(ms)", "Country", "Region", "City");
+            System.out.println("-".repeat(80));
+
+            int displayLimit = Math.min(workingResults.size(), 20);
+            for (int i = 0; i < displayLimit; i++) {
+                CheckResult r = workingResults.get(i);
+                IpLocationInfo loc = r.getLocation();
+                String country = loc != null && loc.getCountryCode() != null ? loc.getCountryCode() : "-";
+                String region = loc != null && loc.getRegion() != null ? loc.getRegion() : "-";
+                String city = loc != null && loc.getCity() != null ? loc.getCity() : "-";
+                System.out.printf("%-4d | %-22s | %-10d | %-8s | %-15s | %-12s%n",
+                        i + 1,
+                        r.getProxy(),
+                        r.getResponseTimeMs(),
+                        country,
+                        region,
+                        city);
+            }
+
+            if (workingResults.size() > 20) {
+                System.out.println("... and " + (workingResults.size() - 20) + " more (see output file)");
+            }
+            System.out.println("=".repeat(80));
+        } else {
+            System.out.println("\nNo working proxies found.");
+        }
+
+        // ===== 新增：生成纯 IP:PORT 的 txt 文件 =====
+        Path pureOutput = output.getParent() != null
+                ? output.getParent().resolve("working_proxies.txt")
+                : Path.of("working_proxies.txt");
+
+        try (java.io.BufferedWriter writer = java.nio.file.Files.newBufferedWriter(pureOutput, java.nio.charset.StandardCharsets.UTF_8)) {
+            for (CheckResult r : workingResults) {
+                String proxy = r.getProxy();
+                if (proxy.contains("://")) {
+                    proxy = proxy.substring(proxy.indexOf("://") + 3);
+                }
+                if (proxy.contains("@")) {
+                    proxy = proxy.substring(proxy.indexOf("@") + 1);
+                }
+                writer.write(proxy);
+                writer.newLine();
+            }
+            System.out.println("\nPure IP:PORT list written to: " + pureOutput.toAbsolutePath());
+        }
+
         return 0;
     }
 }
