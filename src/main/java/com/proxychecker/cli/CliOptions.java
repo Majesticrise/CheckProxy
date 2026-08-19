@@ -12,12 +12,11 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.stream.Collectors;
 
-/**
- * Picocli command-line options and application orchestration.
- */
 @Command(
         name = "proxychecker",
         mixinStandardHelpOptions = true,
@@ -47,6 +46,10 @@ public class CliOptions implements Callable<Integer> {
     @Option(names = {"--format"}, defaultValue = "json", description = "Output format: json or csv")
     private OutputFormatter.OutputFormat format;
 
+    @Option(names = {"--test-url"}, defaultValue = "https://httpbin.org/ip",
+            description = "Test URL that returns JSON with 'origin' field (default: https://httpbin.org/ip)")
+    private String testUrl;
+
     @Override
     public Integer call() throws Exception {
         if (timeout <= 0) {
@@ -73,14 +76,22 @@ public class CliOptions implements Callable<Integer> {
         }
 
         long timeoutMillis = timeout * 1000L;
-        ProxyCheckingService service = new ProxyCheckingService(timeoutMillis, concurrency, ipDatabase);
-        List<CheckResult> results = service.checkAll(proxies);
+        ProxyCheckingService service = new ProxyCheckingService(timeoutMillis, concurrency, ipDatabase, testUrl);
+        List<CheckResult> allResults = service.checkAll(proxies);
+
+        // 过滤出可用的，并按响应时间升序排序（最快的在前面）
+        List<CheckResult> workingResults = allResults.stream()
+                .filter(CheckResult::isWorking)
+                .sorted(Comparator.comparingLong(CheckResult::getResponseTimeMs))
+                .collect(Collectors.toList());
+
+        System.out.println("Total proxies: " + allResults.size() + ", Working: " + workingResults.size());
 
         OutputFormatter formatter = switch (format) {
             case json -> new JsonOutputWriter();
             case csv -> new CsvOutputWriter();
         };
-        formatter.write(results, output);
+        formatter.write(workingResults, output);
 
         System.out.println("Results written to " + output.toAbsolutePath());
         return 0;

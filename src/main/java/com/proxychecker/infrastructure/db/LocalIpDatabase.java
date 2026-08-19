@@ -43,6 +43,7 @@ public class LocalIpDatabase {
             String[] line;
             while ((line = csvReader.readNext()) != null) {
                 try {
+                    // 列顺序: ip_from, ip_to, country_code, region, city, latitude, longitude
                     if (line.length < 7) {
                         continue;
                     }
@@ -83,13 +84,14 @@ public class LocalIpDatabase {
             String[] line;
             while ((line = csvReader.readNext()) != null) {
                 try {
-                    if (line.length < 4) {
+                    // 列顺序: id, start_ip, end_ip, asn, country_code, organization
+                    if (line.length < 6) {
                         continue;
                     }
-                    long start = IpLongConverter.ipToLong(line[0]);
-                    long end = IpLongConverter.ipToLong(line[1]);
-                    Long asn = parseAsn(line[2]);
-                    String asnName = line[3];
+                    long start = IpLongConverter.ipToLong(line[1]);
+                    long end = IpLongConverter.ipToLong(line[2]);
+                    Long asn = parseAsn(line[3]);
+                    String asnName = normalizeAsnName(line[5]); // organization 字段
                     loaded.add(new AsnRecord(start, end, asn, asnName));
                 } catch (Exception e) {
                     log.debug("Skipping invalid ASN record: {}", (Object) line, e);
@@ -146,7 +148,6 @@ public class LocalIpDatabase {
             return null;
         }
 
-        // Use Collections.binarySearch with a dummy key
         int idx = Collections.binarySearch(
                 geoRecords,
                 new GeoRecord(ip, 0, null, null, null, null, null),
@@ -228,5 +229,15 @@ public class LocalIpDatabase {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    /**
+     * 将 ASN 组织名字段规范化：去除 "None" 等无效值。
+     */
+    private String normalizeAsnName(String value) {
+        if (value == null || value.isBlank() || "None".equalsIgnoreCase(value.trim())) {
+            return null;
+        }
+        return value.trim();
     }
 }

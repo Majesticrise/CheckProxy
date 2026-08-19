@@ -4,10 +4,12 @@ import com.proxychecker.domain.CheckResult;
 import com.proxychecker.domain.ProxyInfo;
 import com.proxychecker.infrastructure.db.LocalIpDatabase;
 
+import java.util.concurrent.CompletableFuture;
+
 /**
- * Proxy checking strategy.
+ * Proxy checking strategy. Asynchronous API using OkHttp's dispatcher for concurrency control.
  */
 public interface ProxyChecker {
 
-    CheckResult check(ProxyInfo proxy, long timeoutMillis, LocalIpDatabase localIpDatabase);
+    CompletableFuture<CheckResult> checkAsync(ProxyInfo proxy, long timeoutMillis, LocalIpDatabase localIpDatabase);
 }

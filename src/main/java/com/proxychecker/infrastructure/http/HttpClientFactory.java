@@ -4,6 +4,7 @@ import com.proxychecker.domain.ProxyInfo;
 import com.proxychecker.domain.ProxyProtocol;
 import okhttp3.Authenticator;
 import okhttp3.Credentials;
+import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -11,7 +12,6 @@ import okhttp3.Route;
 
 import javax.net.SocketFactory;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
 import java.io.ByteArrayOutputStream;
@@ -27,14 +27,22 @@ import java.net.Proxy;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketException;
-import java.net.SocketImpl;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Builds OkHttp clients for different proxy protocols with trust-all SSL.
+ * Provides a shared base client for resource reuse and per-proxy customization.
+ *
+ * Protocol handling:
+ *  - HTTP  : OkHttp native HTTP proxy support (plain CONNECT)
+ *  - HTTPS : treated as HTTP proxy (most lists mean "supports HTTPS", not "TLS to proxy")
+ *  - SOCKS4: custom socket factory with SOCKS4 handshake
+ *  - SOCKS5: custom socket factory with SOCKS5 handshake (supports auth)
  */
 public final class HttpClientFactory {
 
@@ -72,25 +80,49 @@ public final class HttpClientFactory {
         return TRUST_ALL_SSL_FACTORY;
     }
 
-    public static OkHttpClient createClient(ProxyInfo proxy, long timeoutMillis) {
-        OkHttpClient.Builder builder = new OkHttpClient.Builder()
+    /**
+     * Creates a shared OkHttpClient with a virtual-thread-backed Dispatcher.
+     * The dispatcher enforces the concurrency limit.
+     *
+     * @param concurrency    maximum number of concurrent requests
+     * @param timeoutMillis  connect/read/call timeout in milliseconds
+     * @return a reusable OkHttpClient
+     */
+    public static OkHttpClient createSharedClient(int concurrency, long timeoutMillis) {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        Dispatcher dispatcher = new Dispatcher(executor);
+        dispatcher.setMaxRequests(concurrency);
+        dispatcher.setMaxRequestsPerHost(concurrency);
+
+        return new OkHttpClient.Builder()
                 .sslSocketFactory(TRUST_ALL_SSL_FACTORY, TRUST_ALL_MANAGER)
                 .hostnameVerifier((hostname, session) -> true)
                 .connectTimeout(timeoutMillis, TimeUnit.MILLISECONDS)
                 .readTimeout(timeoutMillis, TimeUnit.MILLISECONDS)
                 .callTimeout(timeoutMillis, TimeUnit.MILLISECONDS)
-                .proxy(Proxy.NO_PROXY);
+                .proxy(Proxy.NO_PROXY)
+                .dispatcher(dispatcher)
+                .build();
+    }
+
+    /**
+     * Creates a per-proxy client by customizing the shared base client.
+     * Reuses connection pool and dispatcher.
+     *
+     * @param proxy          proxy information
+     * @param timeoutMillis  timeout for this proxy
+     * @param sharedClient   the shared base client
+     * @return a customized OkHttpClient for the given proxy
+     */
+    public static OkHttpClient createClient(ProxyInfo proxy, long timeoutMillis, OkHttpClient sharedClient) {
+        OkHttpClient.Builder builder = sharedClient.newBuilder();
 
         switch (proxy.protocol()) {
-            case HTTP -> {
+            case HTTP, HTTPS -> {
+                // Treat HTTPS as HTTP proxy (most proxy lists use "https" to mean
+                // "supports HTTPS", not that the proxy connection itself uses TLS)
                 builder.proxy(new Proxy(Proxy.Type.HTTP,
                         new InetSocketAddress(proxy.host(), proxy.port())));
-                configureProxyAuth(builder, proxy);
-            }
-            case HTTPS -> {
-                builder.proxy(new Proxy(Proxy.Type.HTTP,
-                        new InetSocketAddress(proxy.host(), proxy.port())));
-                builder.socketFactory(new TlsProxySocketFactory(proxy, TRUST_ALL_SSL_FACTORY, timeoutMillis));
                 configureProxyAuth(builder, proxy);
             }
             case SOCKS4, SOCKS5 -> {
@@ -115,161 +147,6 @@ public final class HttpClientFactory {
                             .build();
                 }
             });
-        }
-    }
-
-    /**
-     * SocketFactory for HTTPS proxies. Creates a connected SSLSocket to the proxy,
-     * then wraps it in a delegate Socket that avoids re-connecting.
-     */
-    private static class TlsProxySocketFactory extends SocketFactory {
-
-        private final ProxyInfo proxy;
-        private final SSLSocketFactory sslSocketFactory;
-        private final long timeoutMillis;
-
-        TlsProxySocketFactory(ProxyInfo proxy, SSLSocketFactory sslSocketFactory, long timeoutMillis) {
-            this.proxy = proxy;
-            this.sslSocketFactory = sslSocketFactory;
-            this.timeoutMillis = timeoutMillis;
-        }
-
-        @Override
-        public Socket createSocket() {
-            try {
-                // 1. Create a plain TCP socket and connect to the proxy
-                Socket plainSocket = new Socket();
-                plainSocket.connect(new InetSocketAddress(proxy.host(), proxy.port()), (int) timeoutMillis);
-                plainSocket.setSoTimeout((int) timeoutMillis);
-
-                // 2. Wrap it in an SSLSocket (TLS handshake to the proxy)
-                SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(
-                        plainSocket, proxy.host(), proxy.port(), true);
-                sslSocket.setUseClientMode(true);
-                sslSocket.startHandshake();
-
-                // 3. Return a delegate that prevents OkHttp from re-connecting
-                return new PreConnectedSocket(sslSocket);
-
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to establish TLS connection to proxy " + proxy.toUrl(), e);
-            }
-        }
-
-        // Other createSocket methods delegate to the default factory, but they will not be used by OkHttp.
-        @Override
-        public Socket createSocket(String host, int port) throws IOException {
-            return sslSocketFactory.createSocket(host, port);
-        }
-
-        @Override
-        public Socket createSocket(String host, int port, InetAddress localHost, int localPort) throws IOException {
-            return sslSocketFactory.createSocket(host, port, localHost, localPort);
-        }
-
-        @Override
-        public Socket createSocket(InetAddress host, int port) throws IOException {
-            return sslSocketFactory.createSocket(host, port);
-        }
-
-        @Override
-        public Socket createSocket(InetAddress address, int port, InetAddress localAddress, int localPort) throws IOException {
-            return sslSocketFactory.createSocket(address, port, localAddress, localPort);
-        }
-    }
-
-    /**
-     * A Socket wrapper that delegates to an already connected SSLSocket.
-     * It overrides connect() to be a no-op when already connected, avoiding
-     * "Already connected" exceptions from OkHttp.
-     */
-    private static class PreConnectedSocket extends Socket {
-
-        private final Socket delegate;
-
-        PreConnectedSocket(Socket delegate) {
-            super();
-            this.delegate = delegate;
-        }
-
-        @Override
-        public void connect(SocketAddress endpoint) throws IOException {
-            // Already connected, do nothing.
-        }
-
-        @Override
-        public void connect(SocketAddress endpoint, int timeout) throws IOException {
-            // Already connected, do nothing.
-        }
-
-        @Override
-        public InputStream getInputStream() throws IOException {
-            return delegate.getInputStream();
-        }
-
-        @Override
-        public OutputStream getOutputStream() throws IOException {
-            return delegate.getOutputStream();
-        }
-
-        @Override
-        public boolean isConnected() {
-            return delegate.isConnected();
-        }
-
-        @Override
-        public boolean isClosed() {
-            return delegate.isClosed();
-        }
-
-        @Override
-        public void close() throws IOException {
-            delegate.close();
-        }
-
-        @Override
-        public void setSoTimeout(int timeout) throws SocketException {
-            delegate.setSoTimeout(timeout);
-        }
-
-        @Override
-        public int getSoTimeout() throws SocketException {
-            return delegate.getSoTimeout();
-        }
-
-        @Override
-        public void setTcpNoDelay(boolean on) throws SocketException {
-            delegate.setTcpNoDelay(on);
-        }
-
-        @Override
-        public boolean getTcpNoDelay() throws SocketException {
-            return delegate.getTcpNoDelay();
-        }
-
-        @Override
-        public void setKeepAlive(boolean on) throws SocketException {
-            delegate.setKeepAlive(on);
-        }
-
-        @Override
-        public boolean getKeepAlive() throws SocketException {
-            return delegate.getKeepAlive();
-        }
-
-        @Override
-        public void setReuseAddress(boolean on) throws SocketException {
-            delegate.setReuseAddress(on);
-        }
-
-        @Override
-        public boolean getReuseAddress() throws SocketException {
-            return delegate.getReuseAddress();
-        }
-
-        @Override
-        public String toString() {
-            return delegate.toString();
         }
     }
 
@@ -422,7 +299,7 @@ public final class HttpClientFactory {
         @Override
         public void connect(SocketAddress endpoint, int timeout) throws IOException {
             if (handshakeDone) {
-                return; // Already connected and handshake completed
+                return;
             }
 
             super.connect(new InetSocketAddress(proxy.host(), proxy.port()), timeout);
